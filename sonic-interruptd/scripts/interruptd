@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+
+"""
+    interruptd
+    device interrupt handler daemon for SONiC
+"""
+
+import signal
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+import sonic_platform
+import syslog
+from sonic_py_common import daemon_base, logger
+from sonic_py_common.task_base import ProcessTaskBase
+from swsscommon import swsscommon
+
+
+# TODO: Once we no longer support Python 2, we can eliminate this and get the
+# name using the 'name' field (e.g., `signal.SIGINT.name`) starting with Python 3.5
+SIGNALS_TO_NAMES_DICT = dict((getattr(signal, n), n)
+                             for n in dir(signal) if n.startswith('SIG') and '_' not in n)
+
+SYSLOG_IDENTIFIER = 'interruptd'
+NOT_AVAILABLE = 'N/A'
+PHYSICAL_ENTITY_INFO_TABLE = 'PHYSICAL_ENTITY_INFO'
+ERR_UNKNOWN = 1
+
+# Interrupt control daemon is designed to never exit, it must always
+# return non-zero exit code when exiting and so that supervisord will
+# restart it automatically.
+exit_code = ERR_UNKNOWN
+
+# utility functions
+
+def try_get(callback, default=NOT_AVAILABLE):
+    """
+    Handy function to invoke the callback and catch NotImplementedError
+    :param callback: Callback to be invoked
+    :param default: Default return value if exception occur
+    :return: Default return value if exception occur else return value of the callback
+    """
+    try:
+        ret = callback()
+        if ret is None:
+            ret = default
+    except NotImplementedError:
+        ret = default
+
+    return ret
+
+#
+# InterruptUpdater  ======================================================================
+#
+class InterruptUpdater(logger.Logger):
+    """
+        InterruptUpdate: Responsible for fetching interrupts from platform chassis interrupt handler
+        and update all interrupt information to database
+    """
+    # interrupt information table name in database
+    INTERRUPT_INFO_TABLE_NAME = 'INTERRUPT_INFO'
+
+    def __init__(self, chassis, task_stopping_event):
+        """
+        Initializer of InterruptUpdater
+        :param chassis: Object representing a platform chassis
+        """
+        super(InterruptUpdater, self).__init__(SYSLOG_IDENTIFIER)
+
+        self.chassis = chassis
+        self.interrupt_handler = chassis.get_interrupt_handler()
+        self.task_stopping_event = task_stopping_event
+        self.interrupt_status_dict = {}
+        state_db = daemon_base.db_connect("STATE_DB")
+        self.table = swsscommon.Table(state_db, InterruptUpdater.INTERRUPT_INFO_TABLE_NAME)
+        self.phy_entity_table = swsscommon.Table(state_db, PHYSICAL_ENTITY_INFO_TABLE)
+
+    def __del__(self):
+        if self.table:
+            table_keys = self.table.getKeys()
+            for tk in table_keys:
+                self.table._del(tk)
+        if self.phy_entity_table:
+            phy_entity_keys = self.phy_entity_table.getKeys()
+            for pek in phy_entity_keys:
+                self.phy_entity_table._del(pek)
+
+    def deinit(self):
+        """
+        Deinitializer of InterruptUpdater
+        :return:
+        """
+        for name in self.interrupt_status_dict.keys():
+            self.table._del(name)
+
+    def update(self):
+        """
+        Update all interrupt information to database
+        :return:
+        """
+        self.log_debug("Start interrupt updating")
+        if self.task_stopping_event.is_set():
+            return
+
+        status, interrupt_info_list, msg = self.interrupt_handler.interrupt_get()
+        """
+        interrupt_handler have interrupt_get function 
+        :return:
+            status: Boolean, success or failure
+            interrupt_info_list: list of interrupt_info type if interrupts are available
+            msg: platform specific warning/debug message
+        """
+        if status:
+            if msg:
+                self.log_debug(msg)
+            for interrupt_info in interrupt_info_list:
+                self._refresh_interrupt_status(interrupt_info) 
+        else:
+            self.log_warning(msg)
+                
+        self.log_debug("End interrupt updating")
+
+    def _refresh_interrupt_status(self, interrupt_info):
+        """
+        Get interrupt status by platform API and write to database
+        :param interrupt_info: dictionary containing information about interrupt
+            total five keys
+                1. Name: name of interrupt
+                2. Description
+                3. Count: Number of times encountered
+                4. Severity: platform specific interrupt severity (fatal, error, info, hw, etc.)
+                5. Time: timestamp of occurance
+        :return:
+        """
+        name = NOT_AVAILABLE
+        try:
+            name = interrupt_info["Name"]
+            if name not in self.interrupt_status_dict:
+                self.interrupt_status_dict[name] = interrupt_info
+            severity = NOT_AVAILABLE
+            time = NOT_AVAILABLE
+            count = NOT_AVAILABLE
+            description = NOT_AVAILABLE
+            try:
+                description = interrupt_info["Description"]
+                count = interrupt_info["Count"]
+                severity = interrupt_info["Severity"]
+                time = interrupt_info["Time"]
+            except:
+                pass
+            fvs = swsscommon.FieldValuePairs(
+                [('name', str(name)),
+                ('severity', str(severity)),
+                ('description', str(description)),
+                ('count', str(count)),
+                ('timestamp', str(time))
+                ])
+
+            self.table.set(name, fvs)
+
+        except Exception as e:
+            self.log_warning('Failed to update Interrupt values for {} - {}'.format(name, repr(e)))
+
+class EventListener(ProcessTaskBase):
+    """
+    EventListener class listens to any event occured using event handler defined in platform chassis 
+    event_handler consists start and stop function which defines platform specific implementation to 
+        start and stop listening to events as well as handling of event if occured
+    """
+    # Initial update interval
+    INITIAL_INTERVAL = 5
+    
+    def __init__(self, chassis):
+        """
+        Initializer for EventListener
+        :param chassis: Object representing a platform chassis
+        """
+        super(EventListener, self).__init__()
+        self.chassis = chassis
+        self.event_handler = chassis.get_event_handler()
+        self.wait_time = self.INITIAL_INTERVAL
+
+        # TODO: Refactor to eliminate the need for this Logger instance
+        self.logger = logger.Logger(SYSLOG_IDENTIFIER)
+
+        # Set minimum logging level to INFO
+        self.logger.set_min_log_priority_info()
+
+    def main(self):
+        self.event_handler.start()
+
+    def task_worker(self):
+        """
+        Thread function to handle interrupt status update
+        :return:
+        """
+        self.logger.log_info("Start event listening loop")
+
+        # Start loop to listen to events published
+        while not self.task_stopping_event.wait(self.wait_time):
+            self.main()
+
+        self.event_handler.stop()
+
+        self.logger.log_info("Stop event listening loop")
+
+
+class InterruptMonitor(ProcessTaskBase):
+    # Initial update interval
+    INITIAL_INTERVAL = 5
+
+    # Update interval value
+    UPDATE_INTERVAL = 60
+
+    # Update elapse threshold. If update used time is larger than the value, generate a warning log.
+    UPDATE_ELAPSED_THRESHOLD = 30
+
+    def __init__(self, chassis):
+        """
+        Initializer for InterruptMonitor
+        :param chassis: Object representing a platform chassis
+        """
+        super(InterruptMonitor, self).__init__()
+
+        self.wait_time = self.INITIAL_INTERVAL
+
+        # TODO: Refactor to eliminate the need for this Logger instance
+        self.logger = logger.Logger(SYSLOG_IDENTIFIER)
+
+        # Set minimum logging level to INFO
+        self.logger.set_min_log_priority_info()
+
+        self.interrupt_updater = InterruptUpdater(chassis, self.task_stopping_event)
+
+    def main(self):
+        begin = time.time()
+        self.interrupt_updater.update()
+        elapsed = time.time() - begin
+        if elapsed < self.UPDATE_INTERVAL:
+            self.wait_time = self.UPDATE_INTERVAL - elapsed
+        else:
+            self.wait_time = self.INITIAL_INTERVAL
+
+        if elapsed > self.UPDATE_ELAPSED_THRESHOLD:
+            self.logger.log_warning('Update interrupt status took {} seconds, '
+                                    'there might be performance risk'.format(elapsed))
+
+    def task_worker(self):
+        """
+        Thread function to handle interrupt status update
+        :return:
+        """
+        self.logger.log_info("Start interrupt monitoring loop")
+
+        # Start loop to update interrupt info in DB periodically
+        while not self.task_stopping_event.wait(self.wait_time):
+            self.main()
+
+        self.interrupt_updater.deinit()
+
+        self.logger.log_info("Stop interrupt monitoring loop")
+
+
+#
+# Daemon =======================================================================
+#
+class InterruptDaemon(daemon_base.DaemonBase):
+    # Interval to run interrupt control logic
+    INTERVAL = 60
+    RUN_POLICY_WARN_THRESHOLD_SECS = 30
+    FAST_START_INTERVAL = 15
+
+    def __init__(self):
+        """
+        Initializer of InterruptDaemon
+        """
+        super(InterruptDaemon, self).__init__(SYSLOG_IDENTIFIER)
+
+        # Set minimum logging level to INFO
+        self.set_min_log_priority_info()
+
+        self.stop_event = threading.Event()
+
+        self.wait_time = self.INTERVAL
+
+        self.chassis = sonic_platform.platform.Platform().get_chassis()
+
+        self.interrupt_monitor = InterruptMonitor(self.chassis)
+        self.interrupt_monitor.task_run()
+        self.event_listener = EventListener(self.chassis)
+        self.event_listener.task_run()
+
+    def deinit(self):
+        """
+        Deinitializer of InterruptDaemon
+        """
+        self.interrupt_monitor.task_stop()
+        self.event_listener.task_stop()
+
+    # Override signal handler from DaemonBase
+    def signal_handler(self, sig, frame):
+        """
+        Signal handler
+        :param sig: Signal number
+        :param frame: not used
+        :return:
+        """
+        FATAL_SIGNALS = [signal.SIGINT, signal.SIGTERM]
+        NONFATAL_SIGNALS = [signal.SIGHUP]
+
+        global exit_code
+
+        if sig in FATAL_SIGNALS:
+            self.log_info("Caught signal '{}' - exiting...".format(SIGNALS_TO_NAMES_DICT[sig]))
+            exit_code = 128 + sig  # Make sure we exit with a non-zero code so that supervisor will try to restart us
+            self.interrupt_monitor.task_stop()
+            self.stop_event.set()
+        elif sig in NONFATAL_SIGNALS:
+            self.log_info("Caught signal '{}' - ignoring...".format(SIGNALS_TO_NAMES_DICT[sig]))
+        else:
+            self.log_warning("Caught unhandled signal '{}' - ignoring...".format(SIGNALS_TO_NAMES_DICT[sig]))
+
+    # Main daemon logic
+    def run(self):
+        """
+        Run main logical of this daemon
+        :return:
+        """
+        if self.stop_event.wait(self.wait_time):
+            # We received a fatal signal
+            return False
+        return True
+
+
+#
+# Main =========================================================================
+#
+def main():
+    interruptd = InterruptDaemon()
+
+    interruptd.log_info("Starting up...")
+
+    while interruptd.run():
+        pass
+
+    interruptd.log_info("Shutting down with exit code {}...".format(exit_code))
+
+    interruptd.deinit()
+
+    return exit_code
+
+
+if __name__ == '__main__':
+    sys.exit(main())
